@@ -1,0 +1,13 @@
+# Apple Silicon (arm64) + macOS 14+ only. Create with:
+#   conda env create -f environment.yml
+# Core packages are pinned to the verified working versions; pip resolves the rest.
+name: cooking-vlm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - mlx-vlm==0.7.10
+      - mlx==0.32.4
+      - transformers==5.20.2
