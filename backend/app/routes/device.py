@@ -7,7 +7,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 
 from ..orchestrator import Orchestrator
-from ..schemas import ButtonRequest, DeviceState, DeviceStateUnchanged
+from ..schemas import AckRequest, ButtonRequest, DeviceState, DeviceStateUnchanged
 
 router = APIRouter(tags=["device"])
 
@@ -18,13 +18,16 @@ def orch(request: Request) -> Orchestrator:
     return request.app.state.orch
 
 
-@router.get("/device/state", response_model=DeviceState | DeviceStateUnchanged, response_model_exclude_none=False)
+@router.get("/device/state", response_model=DeviceState | DeviceStateUnchanged)
 async def device_state(request: Request, since_version: int | None = None):
-    """Poll every ~500 ms. With since_version equal to the current version you get a tiny
-    {"changed": false, ...} body that still carries remaining_s so the countdown stays in sync."""
+    """Poll every ~500 ms. ``version`` changes only when something the device shows changes;
+    the countdown is carried separately in ``remaining_ms`` on every response (changed or not),
+    so re-anchor the local countdown from it each time."""
     state = orch(request).snapshot()
     if since_version is not None and since_version == state.version:
-        return DeviceStateUnchanged(version=state.version, remaining_s=state.remaining_s)
+        return DeviceStateUnchanged(
+            version=state.version, timer=state.timer, remaining_ms=state.remaining_ms, remaining_s=state.remaining_s
+        )
     return state
 
 
@@ -55,10 +58,27 @@ async def device_button(request: Request, body: ButtonRequest):
     return await orch(request).button(body.button)
 
 
+@router.post("/device/ack", response_model=DeviceState)
+async def device_ack(request: Request, body: AckRequest):
+    """Acknowledge an alert by id. Idempotent: acking an already-acked id returns 200."""
+    state, known = await orch(request).ack(body.alert_id)
+    if not known:
+        raise HTTPException(status_code=404, detail=f"unknown alert id {body.alert_id}")
+    return state
+
+
+@router.get("/device/alerts")
+async def device_alerts(request: Request):
+    """All unacknowledged alerts, most important first."""
+    with orch(request).store.read() as s:
+        alerts = sorted(s.alerts, key=lambda a: (-a.severity, a.id))
+        return {"alerts": [a.model_dump(mode="json", include={"id", "type", "text", "message", "audio_id"}) for a in alerts]}
+
+
 @router.websocket("/ws/device")
 async def device_ws(websocket: WebSocket):
-    """Pushes the full state JSON whenever the version changes (and once per second while
-    cooking, so remaining_s stays fresh). Polling works without this."""
+    """Pushes the full state JSON whenever the version changes (and once per second while a
+    timer runs, so remaining_ms stays fresh). Polling works without this."""
     await websocket.accept()
     o: Orchestrator = websocket.app.state.orch
     last_version = -1
