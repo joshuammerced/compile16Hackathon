@@ -1,8 +1,11 @@
-"""Deterministic food-safety guardrail applied after the LLM.
+"""Deterministic food-safety knowledge: USDA temperatures, time bounds, typical cook times.
 
 USDA safe minimum internal temperatures (https://www.fsis.usda.gov/food-safety/safe-food-handling-and-preparation/food-safety-basics/safe-temperature-chart):
 poultry 165°F, ground meats 160°F, whole cuts of beef/pork/veal/lamb 145°F + 3 min rest,
 fish & shellfish 145°F, egg dishes 160°F, leftovers & casseroles 165°F.
+
+Typical times are *suggestions* for a reminder timer. Neither a timer nor a camera can tell
+that food is safe; only a thermometer can, which is what the spoken reminders say.
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from ..schemas import CookingDecision
+from ..schemas import TimerSuggestion
 
 log = logging.getLogger(__name__)
 
@@ -41,16 +44,59 @@ DEFAULT_RULE = CategoryRule(None, 30, 4 * 3600)
 LEFTOVERS_TEMP_F = 165
 LEFTOVER_WORDS = ("leftover", "casserole", "reheat")
 
-THERMOMETER_REMINDER = "A timer is no substitute for a thermometer, so check it reaches {temp} degrees."
+# (keywords, category, typical stovetop/oven seconds). First match wins, so specific entries
+# come before generic ones ("boiled egg" before "egg", "ground beef" before "beef").
+FOOD_TABLE: list[tuple[tuple[str, ...], str, int]] = [
+    (("boiled egg", "hard-boiled", "hard boiled"), "eggs", 10 * 60),
+    (("fried rice",), "grains_pasta", 8 * 60),
+    (("chicken breast",), "poultry", 14 * 60),
+    (("chicken thigh", "drumstick", "chicken wing"), "poultry", 20 * 60),
+    (("chicken", "turkey", "duck", "poultry"), "poultry", 15 * 60),
+    (("ground beef", "ground pork", "ground turkey", "burger", "patty", "meatball", "sausage", "mince"),
+     "ground_meat", 10 * 60),
+    (("bacon",), "pork", 8 * 60),
+    (("pork chop", "pork", "ham"), "pork", 10 * 60),
+    (("steak", "beef", "lamb", "veal", "roast"), "whole_cut_meat", 8 * 60),
+    (("salmon", "fish", "cod", "tuna", "tilapia", "shrimp", "prawn", "scallop", "seafood"), "seafood", 8 * 60),
+    (("omelet", "omelette", "scrambled", "fried egg", "egg"), "eggs", 3 * 60),
+    (("spaghetti", "pasta", "noodle", "macaroni", "penne", "linguine"), "grains_pasta", 10 * 60),
+    (("rice",), "grains_pasta", 18 * 60),
+    (("oatmeal", "porridge", "oats"), "grains_pasta", 5 * 60),
+    (("pancake", "crepe"), "baked_goods", 4 * 60),
+    (("cookie",), "baked_goods", 11 * 60),
+    (("cake", "muffin", "bread"), "baked_goods", 30 * 60),
+    (("potato",), "vegetables", 20 * 60),
+    (("broccoli", "carrot", "vegetable", "onion", "pepper", "spinach", "mushroom", "zucchini", "green bean"),
+     "vegetables", 8 * 60),
+    (("tofu",), "other", 8 * 60),
+]  # fmt: skip
+
+
+@dataclass(frozen=True)
+class FoodInfo:
+    name: str
+    category: str | None
+    typical_s: int | None
+    safe_temp_f: int | None
+    rest_min: int
+    is_meat: bool
 
 
 def rule_for(category: str | None) -> CategoryRule:
     return RULES.get(category or "", DEFAULT_RULE)
 
 
-def is_leftovers(decision: CookingDecision) -> bool:
-    text = " ".join(filter(None, [decision.food_name, decision.cooking_method])).lower()
-    return any(word in text for word in LEFTOVER_WORDS)
+def classify(food_name: str | None) -> FoodInfo:
+    name = (food_name or "").strip()
+    lower = name.lower()
+    category, typical = None, None
+    for words, cat, secs in FOOD_TABLE:
+        if any(w in lower for w in words):
+            category, typical = cat, secs
+            break
+    rule = rule_for(category)
+    temp = LEFTOVERS_TEMP_F if any(w in lower for w in LEFTOVER_WORDS) else rule.safe_temp_f
+    return FoodInfo(name, category, typical, temp, rule.rest_min, rule.is_meat)
 
 
 def clamp_seconds(seconds: int, category: str | None) -> int:
@@ -68,39 +114,26 @@ def clamp_seconds(seconds: int, category: str | None) -> int:
     return clamped
 
 
-def apply(decision: CookingDecision) -> CookingDecision:
-    """Return a copy of the decision with authoritative temps, clamped times and reminders."""
-    rule = rule_for(decision.food_category)
-    update: dict = {}
+def suggest_timer(food_name: str | None) -> TimerSuggestion | None:
+    info = classify(food_name)
+    if not info.name or info.typical_s is None:
+        return None
+    return TimerSuggestion(
+        food=info.name,
+        seconds=clamp_seconds(info.typical_s, info.category),
+        category=info.category,
+        safe_temp_f=info.safe_temp_f,
+    )
 
-    safe_temp = rule.safe_temp_f
-    if is_leftovers(decision):
-        safe_temp = LEFTOVERS_TEMP_F
-    if safe_temp is not None and decision.safe_internal_temp_f != safe_temp:
-        if decision.safe_internal_temp_f is not None:
-            log.warning(
-                "food_safety: overriding safe temp %s°F -> %d°F for %s",
-                decision.safe_internal_temp_f,
-                safe_temp,
-                decision.food_category,
-            )
-        update["safe_internal_temp_f"] = safe_temp
 
-    if decision.action == "start_timer":
-        if decision.recommended_cook_seconds is None or decision.recommended_cook_seconds <= 0:
-            log.warning("food_safety: start_timer without a cook time; using category minimum")
-            update["recommended_cook_seconds"] = rule.min_s
-        else:
-            clamped = clamp_seconds(decision.recommended_cook_seconds, decision.food_category)
-            if clamped != decision.recommended_cook_seconds:
-                update["recommended_cook_seconds"] = clamped
-
-    if rule.rest_min and not decision.safety_notes:
-        update["safety_notes"] = f"Rest {rule.rest_min} minutes before cutting."
-
-    if rule.is_meat and safe_temp is not None and decision.action in ("start_timer", "answer_question"):
-        reminder = THERMOMETER_REMINDER.format(temp=safe_temp)
-        if "thermometer" not in decision.spoken_feedback.lower():
-            update["spoken_feedback"] = f"{decision.spoken_feedback.rstrip()} {reminder}"
-
-    return decision.model_copy(update=update) if update else decision
+def thermometer_reminder(info: FoodInfo) -> str | None:
+    """Spoken reminder for foods where doneness is a safety question."""
+    if info.safe_temp_f is None:
+        return None
+    if info.category == "eggs" and info.safe_temp_f != LEFTOVERS_TEMP_F:
+        return f"Cook eggs until the white and yolk are firm; egg dishes should reach {info.safe_temp_f} degrees."
+    rest = f", then rest it {info.rest_min} minutes" if info.rest_min else ""
+    return (
+        "A timer or camera can't tell if it's safe. Use a thermometer: "
+        f"it should reach {info.safe_temp_f} degrees{rest}."
+    )

@@ -1,92 +1,57 @@
-"""Local Qwen3-VL-4B provider (MLX-VLM on Apple Silicon).
+"""Adapter for the team's local Qwen3-VL-4B model in LLM/inference.py (MLX, Apple Silicon).
 
-Reuses ``CookingVLM`` from the repo's ``LLM/inference.py`` to load
-``mlx-community/Qwen3-VL-4B-Instruct-4bit``. Must run in a Python that has mlx-vlm installed
-(the ``cooking-vlm`` conda env). Structured output is requested in the prompt; the router
-validates with Pydantic and retries once, as for every provider.
+The module is imported from its file path (VLM_INFERENCE_PATH) so LLM/ stays the single source
+of truth for the model id and COOKING_PROMPT. ``CookingVLM.assess()`` takes an image path, so
+each frame is written to one reused temp file; only one inference thread ever touches it.
 """
 
 from __future__ import annotations
 
-import asyncio
-import io
-import json
+import importlib.util
 import logging
-import sys
-from concurrent.futures import ThreadPoolExecutor
+import tempfile
+import time
 from pathlib import Path
+from types import ModuleType
 
-from ..schemas import decision_json_schema
-from .base import LLMProvider, LLMRequest
+from .base import VisionProvider
 
 log = logging.getLogger(__name__)
 
-LLM_DIR = Path(__file__).resolve().parents[3] / "LLM"
 
-JSON_INSTRUCTIONS = """\
+def load_inference_module(path: Path) -> ModuleType:
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"vision model code not found: {path} (set VLM_INFERENCE_PATH)")
+    spec = importlib.util.spec_from_file_location("cooking_inference", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot import {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-Respond with ONLY one JSON object (no markdown, no prose) that matches this JSON schema. \
-Every property is required; use null where a field does not apply.
-{schema}"""
 
+class QwenVLMProvider(VisionProvider):
+    name = "qwen3-vl"
 
-class QwenProvider(LLMProvider):
-    name = "qwen"
-
-    def __init__(self, model: str | None = None, max_tokens: int = 512):
+    def __init__(self, inference_path: Path, model_id: str | None = None, max_tokens: int = 200):
+        self.inference_path = Path(inference_path)
+        self.model_id = model_id
         self.max_tokens = max_tokens
-        self._schema = json.dumps(decision_json_schema())
-        # MLX streams are per-thread: load and generate on the same single worker thread.
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen")
-        self._vlm = self._executor.submit(self._load, model).result()
-        self.model = self._vlm.model_id
+        self._vlm = None
+        self._tmp = Path(tempfile.mkdtemp(prefix="cooking-vlm-")) / "frame.jpg"
 
-    @staticmethod
-    def _load(model: str | None):
-        if str(LLM_DIR) not in sys.path:
-            sys.path.insert(0, str(LLM_DIR))
-        from inference import MODEL_ID, CookingVLM
+    def load(self) -> None:
+        module = load_inference_module(self.inference_path)
+        self.model_id = self.model_id or module.MODEL_ID
+        t0 = time.perf_counter()
+        # Raises module.ModelLoadError on machines without MLX (anything but Apple Silicon).
+        self._vlm = module.CookingVLM(self.model_id)
+        log.info("loaded %s in %.1fs", self.model_id, time.perf_counter() - t0)
 
-        model_id = model or MODEL_ID
-        log.info("loading local VLM %s", model_id)
-        return CookingVLM(model_id)
-
-    def _prompt(self, request: LLMRequest) -> str:
-        text = f"{request.system}\n{request.user_text}{JSON_INSTRUCTIONS.format(schema=self._schema)}"
-        if request.retry_feedback:
-            text += (
-                f"\n\nYour previous answer was rejected by the validator: {request.retry_feedback}\n"
-                "Return one corrected JSON object."
-            )
-        return text
-
-    def _generate_sync(self, request: LLMRequest) -> str:
-        from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import apply_chat_template
-        from PIL import Image
-
-        vlm = self._vlm
-        images = [Image.open(io.BytesIO(request.image_jpeg)).convert("RGB")] if request.image_jpeg else []
-        prompt = apply_chat_template(vlm.processor, vlm.config, self._prompt(request), num_images=len(images))
-        result = generate(
-            vlm.model,
-            vlm.processor,
-            prompt,
-            image=images or None,
-            max_tokens=self.max_tokens,
-            temperature=0.0,
-            verbose=False,
-        )
-        log.debug(
-            "qwen: %d prompt tokens, %d generated, %.1f tok/s",
-            result.prompt_tokens,
-            result.generation_tokens,
-            result.generation_tps,
-        )
-        if result.finish_reason == "length":
-            raise RuntimeError("model output truncated (max_tokens)")
+    def assess(self, jpeg: bytes) -> str:
+        if self._vlm is None:
+            raise RuntimeError("model not loaded")
+        self._tmp.write_bytes(jpeg)
+        result = self._vlm.assess(self._tmp, max_tokens=self.max_tokens)
         return result.text
-
-    async def generate(self, request: LLMRequest) -> str:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self._generate_sync, request)

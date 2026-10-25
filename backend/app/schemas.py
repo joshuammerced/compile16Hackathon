@@ -1,116 +1,129 @@
-"""Pydantic models: the LLM decision schema and the HTTP API models."""
+"""Pydantic models: visual observations, alerts, and the HTTP API models."""
 
 from __future__ import annotations
 
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel
 
 DISPLAY_TEXT_MAX = 24
 
-FoodCategory = Literal[
-    "poultry",
-    "ground_meat",
-    "whole_cut_meat",
-    "pork",
-    "seafood",
-    "eggs",
-    "vegetables",
-    "grains_pasta",
-    "baked_goods",
-    "other",
-]
 
-DecisionAction = Literal[
-    "start_timer",
-    "ask_clarification",
-    "no_food_detected",
-    "cancel_timer",
-    "adjust_timer",
-    "answer_question",
-]
+def display_text(text: str) -> str:
+    """Fit text to the BOX screen: one line, plain ASCII, at most 24 characters."""
+    text = " ".join(text.split()).encode("ascii", "ignore").decode()
+    return text[:DISPLAY_TEXT_MAX].rstrip()
 
 
-class CookingDecision(BaseModel):
-    action: DecisionAction
-    food_name: str | None = None
-    food_category: FoodCategory | None = None
-    cooking_method: str | None = None
-    confidence: float = Field(ge=0.0, le=1.0)
-    recommended_cook_seconds: int | None = None
-    adjust_seconds: int | None = None
-    safe_internal_temp_f: int | None = None
-    safety_notes: str | None = None
-    display_text: str
-    spoken_feedback: str
+class CookingStatus(str, Enum):
+    """The four statuses the vision model (LLM/inference.py COOKING_PROMPT) may report."""
 
-    @field_validator("display_text")
-    @classmethod
-    def _truncate_display_text(cls, v: str) -> str:
-        # The BOX screen fits ~24 characters in the big font; truncate rather than reject.
-        # Plain ASCII only, since microcontroller fonts rarely include an ellipsis glyph.
-        v = " ".join(v.split())
-        return v[:DISPLAY_TEXT_MAX].rstrip()
+    APPEARS_COOKED = "APPEARS_COOKED"
+    APPEARS_UNDERCOOKED = "APPEARS_UNDERCOOKED"
+    POSSIBLY_OVERCOOKED_OR_BURNT = "POSSIBLY_OVERCOOKED_OR_BURNT"
+    CANNOT_DETERMINE = "CANNOT_DETERMINE"
 
 
-def decision_json_schema() -> dict:
-    """JSON schema for structured outputs.
+class VisualObservation(BaseModel):
+    """What the vision model saw in one frame. Facts only; no commands, no timers.
 
-    Written by hand (rather than CookingDecision.model_json_schema()) so it stays within the
-    subset structured outputs accepts: every property required, no additionalProperties, and
-    nullable fields expressed as anyOf with null. Numeric bounds are enforced by Pydantic.
+    ``recommendation`` is the model's free text. It is kept for debugging but never spoken,
+    because the model sometimes claims food is "safe to eat" despite being told not to.
     """
 
-    def nullable(schema: dict) -> dict:
-        return {"anyOf": [schema, {"type": "null"}]}
+    food: str | None
+    status: CookingStatus
+    evidence: str = ""
+    recommendation: str = ""
+    parse_ok: bool = True
+    frame_seq: int
+    frame_ts: float  # monotonic time the frame was captured
+    observed_at: float  # wall-clock time the result was produced
+    latency_s: float = 0.0
+    raw: str = ""
 
-    return {
-        "type": "object",
-        "properties": {
-            "action": {"type": "string", "enum": list(DecisionAction.__args__)},
-            "food_name": nullable({"type": "string"}),
-            "food_category": nullable({"type": "string", "enum": list(FoodCategory.__args__)}),
-            "cooking_method": nullable({"type": "string"}),
-            "confidence": {"type": "number"},
-            "recommended_cook_seconds": nullable({"type": "integer"}),
-            "adjust_seconds": nullable({"type": "integer"}),
-            "safe_internal_temp_f": nullable({"type": "integer"}),
-            "safety_notes": nullable({"type": "string"}),
-            "display_text": {"type": "string"},
-            "spoken_feedback": {"type": "string"},
-        },
-        "required": list(CookingDecision.model_fields.keys()),
-        "additionalProperties": False,
-    }
+
+class AlertType(str, Enum):
+    OVERCOOK_WARNING = "OVERCOOK_WARNING"  # vision: food may be burning (independent of any timer)
+    TIMER_DONE = "TIMER_DONE"  # the countdown reached zero; says nothing about doneness
+    MONITORING_LOST = "MONITORING_LOST"  # camera stale during a session: nobody is watching the pan
+
+
+ALERT_SEVERITY = {AlertType.OVERCOOK_WARNING: 3, AlertType.TIMER_DONE: 2, AlertType.MONITORING_LOST: 1}
+
+
+class Alert(BaseModel):
+    id: int
+    type: AlertType
+    text: str  # short, for the screen
+    message: str  # spoken
+    audio_id: str | None = None
+    created_at: float  # wall clock
+
+    @property
+    def severity(self) -> int:
+        return ALERT_SEVERITY[self.type]
+
+
+class TimerSuggestion(BaseModel):
+    """A typical cook time from the lookup table. A suggestion only, never a doneness guarantee."""
+
+    food: str
+    seconds: int
+    category: str | None = None
+    safe_temp_f: int | None = None
 
 
 class Phase(str, Enum):
     IDLE = "IDLE"
-    ANALYZING = "ANALYZING"
-    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
-    COOKING = "COOKING"
-    DONE = "DONE"
+    ANALYZING = "ANALYZING"  # session started, waiting for the first usable observation
+    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"  # a timer suggestion awaits thumbs-up
+    MONITORING = "MONITORING"  # watching the food, no timer
+    COOKING = "COOKING"  # watching the food, timer running
+    DONE = "DONE"  # timer reached zero (still watching until acknowledged)
     ERROR = "ERROR"
 
 
+ACTIVE_PHASES = {Phase.ANALYZING, Phase.AWAITING_CONFIRMATION, Phase.MONITORING, Phase.COOKING, Phase.DONE}
+
+TimerStatus = Literal["none", "running", "paused", "expired"]
+
+
 class DeviceState(BaseModel):
-    """Compact state the ESP32-S3-BOX-3 polls. Keep it small."""
+    """Compact state the ESP32-S3-BOX-3 polls. Flat fields so ArduinoJson parsing stays trivial."""
 
     version: int
     state: Phase
     display_text: str
+    # Timer: re-anchor the local countdown from remaining_ms on *every* response.
+    timer: TimerStatus
+    remaining_ms: int
     remaining_s: int
     total_s: int
+    paused: bool
+    # Latest spoken clip (informational speech). Play when it changes.
     audio_id: str | None
+    # Highest-priority unacknowledged alert. Play alert_audio_id when alert_id changes,
+    # keep alerting until POST /device/ack.
     alert: bool
-    paused: bool = False
-    busy: bool = False
+    alert_id: int | None
+    alert_type: AlertType | None
+    alert_text: str | None
+    alert_audio_id: str | None
+    alerts_pending: int
+    # Latest visual condition and whether the camera+model are actually watching right now.
+    condition: CookingStatus | None
+    monitoring: bool
+    busy: bool
+    session_id: str | None
 
 
 class DeviceStateUnchanged(BaseModel):
     changed: Literal[False] = False
     version: int
+    timer: TimerStatus
+    remaining_ms: int
     remaining_s: int
 
 
@@ -118,7 +131,11 @@ class ButtonRequest(BaseModel):
     button: Literal["ack", "cancel", "pause", "resume", "plus_1m", "minus_1m"]
 
 
-class AnalyzeRequest(BaseModel):
+class AckRequest(BaseModel):
+    alert_id: int
+
+
+class CommandRequest(BaseModel):
     transcript: str | None = None
 
 

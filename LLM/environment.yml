@@ -11,3 +11,14 @@ dependencies:
       - mlx-vlm==0.7.10
       - mlx==0.32.4
       - transformers==5.20.2
+      # voice_pipeline.py: speech-to-text, Kokoro-82M text-to-speech, video frames
+      - mlx-audio==0.6.1
+      - misaki[en]==0.9.4
+      - faster-whisper==1.2.1
+      - soundfile==0.14.0
+      - scipy==1.17.1
+      - opencv-python==5.0.0.93
+      # preshed 3.0.14 crashes spaCy's en_core_web_sm load (OverflowError), which Kokoro needs
+      - preshed==3.0.10
+      - murmurhash==1.0.13
+      - cymem==2.0.11
