@@ -53,3 +53,22 @@ def voice_query(request: VoiceRequest):
         "transcript": request.text,
         "response": answer
     }
+from fastapi import UploadFile, File
+from pathlib import Path
+
+@app.post("/api/voice/audio")
+async def receive_audio(file: UploadFile = File(...)):
+
+    audio_data = await file.read()
+
+    output_path = Path("received_audio.wav")
+    output_path.write_bytes(audio_data)
+
+    print(f"Received audio: {len(audio_data)} bytes")
+
+    return {
+        "status": "success",
+        "message": "Audio received successfully",
+        "filename": str(output_path),
+        "bytes": len(audio_data)
+    }
