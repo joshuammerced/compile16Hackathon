@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     cam_capture_url: str = "http://192.168.4.2/capture"
 
     # --- LLM ----------------------------------------------------------------
-    llm_provider: Literal["anthropic", "mock"] = "anthropic"
+    llm_provider: Literal["anthropic", "qwen", "mock"] = "anthropic"
     anthropic_api_key: str | None = None
     llm_model: str = "claude-sonnet-5-5"
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     llm_fallbacks: bool = True
     llm_timeout_s: float = 30.0
     min_confidence: float = 0.55
+    # Local Qwen3-VL (LLM_PROVIDER=qwen; run inside the cooking-vlm conda env).
+    qwen_model: str = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
+    qwen_max_tokens: int = 512
 
     # --- Speech -------------------------------------------------------------
     stt_provider: Literal["whisper", "mock"] = "whisper"

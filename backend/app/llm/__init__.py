@@ -24,4 +24,8 @@ def create_provider(settings: Settings) -> LLMProvider:
             fallbacks=settings.llm_fallbacks,
             timeout_s=settings.llm_timeout_s,
         )
+    if settings.llm_provider == "qwen":
+        from .qwen_provider import QwenProvider
+
+        return QwenProvider(model=settings.qwen_model, max_tokens=settings.qwen_max_tokens)
     return MockProvider()
